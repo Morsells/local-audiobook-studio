@@ -1,7 +1,21 @@
 from __future__ import annotations
 
-def _make_static_cache(StaticCache, config, batch_size, max_cache_len, device, dtype):
-    """Support the StaticCache constructor variants used by recent Transformers."""
+# Production Fast Quality profile selected by the full-generation benchmark.
+FAST_QUALITY_PROFILE = "adaptive_v6"
+ADAPTIVE_TOKENS_PER_WORD = 16
+ADAPTIVE_RESERVE_TOKENS = 64
+ADAPTIVE_MIN_TOKENS = 256
+
+
+def _make_static_cache(
+    StaticCache,
+    config,
+    batch_size,
+    max_cache_len,
+    device,
+    dtype,
+):
+    """Support StaticCache constructor variants used by recent Transformers."""
     attempts = (
         lambda: StaticCache(
             config=config,
@@ -33,7 +47,7 @@ def _make_static_cache(StaticCache, config, batch_size, max_cache_len, device, d
             last = exc
     raise RuntimeError(
         "Installed Transformers StaticCache API is incompatible with the "
-        "experimental CUDA-graph backend."
+        "Fast Quality CUDA-graph backend."
     ) from last
 
 
@@ -53,67 +67,44 @@ def _validate_inputs(self, text_tokens):
     return text_tokens
 
 
-def _sample_next(
-    self,
-    hidden_states,
-    generated_ids,
-    *,
-    cfg_weight,
-    temperature,
-    repetition_penalty_processor,
-    min_p_warper,
-    top_p_warper,
-):
-    import torch
+def _adaptive_generation_limit(self, requested_limit: int) -> int:
+    """
+    Choose a conservative speech-token limit from the current phrase length.
 
-    logits_step = self.speech_head(hidden_states)[:, -1, :]
+    If this limit is reached without EOS, inference_cuda_graph rewinds the CUDA
+    RNG and repeats the phrase with the original requested limit.
+    """
+    words = int(getattr(self, "_las_phrase_word_count", 0) or 0)
+    if words <= 0:
+        return int(requested_limit)
 
-    cond = logits_step[0:1, :]
-    uncond = logits_step[1:2, :]
-    cfg = torch.as_tensor(
-        cfg_weight,
-        device=cond.device,
-        dtype=cond.dtype,
+    adaptive = max(
+        ADAPTIVE_MIN_TOKENS,
+        words * ADAPTIVE_TOKENS_PER_WORD + ADAPTIVE_RESERVE_TOKENS,
     )
-    logits = cond + cfg * (cond - uncond)
-
-    ids_for_proc = generated_ids[:1, ...]
-    logits = repetition_penalty_processor(ids_for_proc, logits)
-
-    if temperature != 1.0:
-        logits = logits / temperature
-
-    logits = min_p_warper(ids_for_proc, logits)
-    logits = top_p_warper(ids_for_proc, logits)
-
-    probs = torch.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1)
+    return min(int(requested_limit), int(adaptive))
 
 
-def inference_cuda_graph(
+def _decode_cuda_graph(
     self,
     *,
     t3_cond,
     text_tokens,
-    initial_speech_tokens=None,
-    prepend_prompt_speech_tokens=None,
-    num_return_sequences=1,
-    max_new_tokens=None,
-    stop_on_eos=True,
-    do_sample=True,
-    temperature=0.8,
-    top_p=0.95,
-    min_p=0.05,
-    length_penalty=1.0,
-    repetition_penalty=1.2,
-    cfg_weight=0.5,
+    initial_speech_tokens,
+    limit,
+    stop_on_eos,
+    temperature,
+    top_p,
+    min_p,
+    repetition_penalty,
+    cfg_weight,
 ):
     """
-    Production CUDA-graph decode for the pinned multilingual V3 path.
+    Execute one FP32 Fast Quality decode attempt.
 
-    Sampling, CFG and token-processing semantics intentionally mirror the
-    official multilingual inference. Only the one-token transformer decode
-    step is graph-captured.
+    Sampling, CFG, model weights and downstream S3Gen semantics remain
+    unchanged. This combines the production CUDA graph with the allocation
+    reductions that passed the V3 parity benchmark.
     """
     import torch
     from transformers import StaticCache
@@ -123,23 +114,7 @@ def inference_cuda_graph(
         TopPLogitsWarper,
     )
 
-    if not torch.cuda.is_available() or not str(self.device).startswith("cuda"):
-        raise RuntimeError("CUDA-graph backend requires an NVIDIA CUDA device.")
-    if prepend_prompt_speech_tokens is not None:
-        raise AssertionError("prepend_prompt_speech_tokens is not implemented")
-    if num_return_sequences != 1:
-        raise ValueError("CUDA-graph backend supports num_return_sequences=1 only.")
-    if not do_sample:
-        raise ValueError("CUDA-graph backend currently mirrors the sampling path only.")
-
-    text_tokens = _validate_inputs(self, text_tokens)
-    max_new_tokens = max_new_tokens or self.hp.max_speech_tokens
-
-    if initial_speech_tokens is None:
-        initial_speech_tokens = (
-            self.hp.start_speech_token
-            * torch.ones_like(text_tokens[:, :1])
-        )
+    limit = int(limit)
 
     embeds, _ = self.prepare_input_embeds(
         t3_cond=t3_cond,
@@ -150,33 +125,59 @@ def inference_cuda_graph(
 
     device = embeds.device
     dtype = embeds.dtype
+    speech_emb = self.speech_emb
+    pos_weight = self.speech_pos_emb.emb.weight
+    speech_head = self.speech_head
+    stop_token = self.hp.stop_speech_token
 
     bos_token = torch.tensor(
         [[self.hp.start_speech_token]],
         dtype=torch.long,
         device=device,
     )
-    bos_embed = self.speech_emb(bos_token)
-    bos_embed = bos_embed + self.speech_pos_emb.get_fixed_embedding(0)
-    bos_embed = torch.cat([bos_embed, bos_embed])
-    inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
+    bos_embed = speech_emb(bos_token)
+    bos_embed = bos_embed + pos_weight[0].view(1, 1, -1)
+    inputs_embeds = torch.cat(
+        [embeds, bos_embed.expand(2, -1, -1)],
+        dim=1,
+    )
 
     if inputs_embeds.size(0) != 2:
         raise RuntimeError(
             "Multilingual CUDA graph expects CFG batch size 2."
         )
 
-    generated_ids = bos_token.clone()
-    predicted = []
+    # Preallocate token history instead of copying an ever-growing torch.cat()
+    # result on every generated speech token.
+    generated = torch.empty(
+        (1, limit + 1),
+        dtype=torch.long,
+        device=device,
+    )
+    generated[:, 0:1] = bos_token
+    generated_len = 1
+    predicted_len = 0
+    hit_eos = False
 
-    top_p_warper = TopPLogitsWarper(top_p=top_p)
+    # Chatterbox Multilingual calls this path with top_p=1.0. At exactly 1.0
+    # TopP is an identity but Transformers still sorts the full vocabulary.
+    top_p_warper = (
+        TopPLogitsWarper(top_p=top_p)
+        if float(top_p) < 1.0
+        else None
+    )
     min_p_warper = MinPLogitsWarper(min_p=min_p)
     repetition_processor = RepetitionPenaltyLogitsProcessor(
         penalty=float(repetition_penalty)
     )
+    cfg_tensor = torch.as_tensor(
+        cfg_weight,
+        device=device,
+        dtype=dtype,
+    )
 
     context_len = int(inputs_embeds.shape[1])
-    max_cache_len = context_len + int(max_new_tokens) + 2
+    max_cache_len = context_len + limit + 2
 
     fixed_cache = _make_static_cache(
         StaticCache,
@@ -187,14 +188,11 @@ def inference_cuda_graph(
         dtype,
     )
 
-    # Explicit positions keep the prefill semantically aligned with the
-    # dynamic-cache baseline.
     prefill_positions = torch.arange(
         context_len,
         device=device,
         dtype=torch.long,
     )
-
     output = self.tfmr(
         inputs_embeds=inputs_embeds,
         past_key_values=fixed_cache,
@@ -217,8 +215,8 @@ def inference_cuda_graph(
         device=device,
     )
 
-    # Warm the exact one-token CUDA kernels on a separate cache. No sampling
-    # occurs here, so the benchmark RNG stream remains unchanged.
+    # Warm the exact one-token kernels on a separate cache. No sampling occurs
+    # here, so this does not consume the production RNG stream.
     warmup_cache = _make_static_cache(
         StaticCache,
         self.cfg,
@@ -238,18 +236,15 @@ def inference_cuda_graph(
         dtype=torch.long,
         device=device,
     )
-    dummy_embed = self.speech_emb(dummy)
-    dummy_embed = (
-        dummy_embed
-        + self.speech_pos_emb.get_fixed_embedding(1)
-    )
-    dummy_embed = torch.cat([dummy_embed, dummy_embed])
+    dummy_embed = speech_emb(dummy)
+    dummy_embed = dummy_embed + pos_weight[1].view(1, 1, -1)
+    dummy_cfg = dummy_embed.expand(2, -1, -1)
 
     warmup_stream = torch.cuda.Stream()
     warmup_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup_stream):
         for _ in range(3):
-            static_embed.copy_(dummy_embed)
+            static_embed.copy_(dummy_cfg)
             self.tfmr(
                 inputs_embeds=static_embed,
                 past_key_values=warmup_cache,
@@ -263,9 +258,7 @@ def inference_cuda_graph(
     torch.cuda.current_stream().wait_stream(warmup_stream)
     del warmup_cache, warmup_position
 
-    # Capture one transformer decode step. The input tensor and cache-position
-    # tensor keep stable addresses and are updated in-place before each replay.
-    static_embed.copy_(dummy_embed)
+    static_embed.copy_(dummy_cfg)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = self.tfmr(
@@ -279,47 +272,179 @@ def inference_cuda_graph(
         )
     static_hidden_states = captured.last_hidden_state
 
-    for i in range(max_new_tokens):
-        next_token = _sample_next(
-            self,
-            hidden_states,
-            generated_ids,
-            cfg_weight=cfg_weight,
-            temperature=temperature,
-            repetition_penalty_processor=repetition_processor,
-            min_p_warper=min_p_warper,
-            top_p_warper=top_p_warper,
-        )
+    for i in range(limit):
+        history = generated[:, :generated_len]
 
-        predicted.append(next_token)
-        generated_ids = torch.cat([generated_ids, next_token], dim=1)
+        logits_step = speech_head(hidden_states)[:, -1, :]
+        cond = logits_step[0:1, :]
+        uncond = logits_step[1:2, :]
+        logits = cond + cfg_tensor * (cond - uncond)
+
+        logits = repetition_processor(history, logits)
+
+        if temperature != 1.0:
+            logits = logits / temperature
+
+        logits = min_p_warper(history, logits)
+        if top_p_warper is not None:
+            logits = top_p_warper(history, logits)
+
+        probs = torch.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+
+        generated[:, generated_len:generated_len + 1] = next_token
+        generated_len += 1
+        predicted_len += 1
 
         if stop_on_eos and bool(
-            (next_token.view(-1) == self.hp.stop_speech_token).all().item()
+            (next_token.view(-1) == stop_token).all().item()
         ):
+            hit_eos = True
             break
 
-        next_token_embed = self.speech_emb(next_token)
+        next_token_embed = speech_emb(next_token)
         next_token_embed = (
             next_token_embed
-            + self.speech_pos_emb.get_fixed_embedding(i + 1)
-        )
-        next_token_embed = torch.cat(
-            [next_token_embed, next_token_embed]
+            + pos_weight[i + 1].view(1, 1, -1)
         )
 
-        static_embed.copy_(next_token_embed)
+        static_embed.copy_(next_token_embed.expand(2, -1, -1))
         graph.replay()
         hidden_states = static_hidden_states
         static_cache_position.add_(1)
 
-    torch.cuda.synchronize()
+    # No unconditional synchronize here. S3Gen consumes the result on the same
+    # CUDA stream. The fallback path synchronizes before restoring the RNG.
+    return (
+        generated[:, 1:1 + predicted_len].clone(),
+        hit_eos,
+        max_cache_len,
+    )
 
-    if not predicted:
-        return torch.empty(
-            (1, 0),
-            dtype=torch.long,
-            device=device,
+
+def inference_cuda_graph(
+    self,
+    *,
+    t3_cond,
+    text_tokens,
+    initial_speech_tokens=None,
+    prepend_prompt_speech_tokens=None,
+    num_return_sequences=1,
+    max_new_tokens=None,
+    stop_on_eos=True,
+    do_sample=True,
+    temperature=0.8,
+    top_p=0.95,
+    min_p=0.05,
+    length_penalty=1.0,
+    repetition_penalty=1.2,
+    cfg_weight=0.5,
+):
+    """
+    Production Fast Quality / adaptive V6 decode.
+
+    Normal audiobook phrases use a smaller StaticCache. If a phrase fails to
+    emit EOS before the adaptive limit, CUDA RNG is rewound and the phrase is
+    regenerated with the original limit. This preserves the baseline random
+    stream instead of returning truncated speech.
+    """
+    import torch
+
+    if not torch.cuda.is_available() or not str(self.device).startswith("cuda"):
+        raise RuntimeError(
+            "Fast Quality CUDA graph requires an NVIDIA CUDA device."
+        )
+    if prepend_prompt_speech_tokens is not None:
+        raise AssertionError(
+            "prepend_prompt_speech_tokens is not implemented"
+        )
+    if num_return_sequences != 1:
+        raise ValueError(
+            "Fast Quality supports num_return_sequences=1 only."
+        )
+    if not do_sample:
+        raise ValueError(
+            "Fast Quality currently mirrors the sampling path only."
         )
 
-    return torch.cat(predicted, dim=1)
+    text_tokens = _validate_inputs(self, text_tokens)
+    requested_limit = int(
+        max_new_tokens or self.hp.max_speech_tokens
+    )
+
+    if initial_speech_tokens is None:
+        initial_speech_tokens = (
+            self.hp.start_speech_token
+            * torch.ones_like(text_tokens[:, :1])
+        )
+
+    adaptive_limit = _adaptive_generation_limit(
+        self,
+        requested_limit,
+    )
+    fallback_possible = adaptive_limit < requested_limit
+
+    # Save the CUDA random stream before the adaptive attempt. If the phrase
+    # reaches its cap, restore this exact state and retry at the original limit.
+    rng_state = (
+        torch.cuda.get_rng_state()
+        if fallback_possible
+        else None
+    )
+
+    tokens, hit_eos, cache_len = _decode_cuda_graph(
+        self,
+        t3_cond=t3_cond,
+        text_tokens=text_tokens,
+        initial_speech_tokens=initial_speech_tokens,
+        limit=adaptive_limit,
+        stop_on_eos=stop_on_eos,
+        temperature=temperature,
+        top_p=top_p,
+        min_p=min_p,
+        repetition_penalty=repetition_penalty,
+        cfg_weight=cfg_weight,
+    )
+
+    meta = {
+        "profile": FAST_QUALITY_PROFILE,
+        "words": int(
+            getattr(self, "_las_phrase_word_count", 0) or 0
+        ),
+        "requested_limit": requested_limit,
+        "adaptive_limit": adaptive_limit,
+        "cache_len": cache_len,
+        "fallback": False,
+        "tokens": int(tokens.shape[-1]),
+    }
+
+    if (
+        stop_on_eos
+        and fallback_possible
+        and not hit_eos
+    ):
+        # Finish outstanding GPU work before restoring the random stream.
+        torch.cuda.synchronize()
+        torch.cuda.set_rng_state(rng_state)
+
+        tokens, hit_eos, cache_len = _decode_cuda_graph(
+            self,
+            t3_cond=t3_cond,
+            text_tokens=text_tokens,
+            initial_speech_tokens=initial_speech_tokens,
+            limit=requested_limit,
+            stop_on_eos=stop_on_eos,
+            temperature=temperature,
+            top_p=top_p,
+            min_p=min_p,
+            repetition_penalty=repetition_penalty,
+            cfg_weight=cfg_weight,
+        )
+        meta.update({
+            "cache_len": cache_len,
+            "fallback": True,
+            "tokens": int(tokens.shape[-1]),
+        })
+
+    self._las_fast_quality_last = meta
+    return tokens

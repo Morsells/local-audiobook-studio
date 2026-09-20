@@ -457,6 +457,13 @@ def synthesize(
                     flush=True,
                 )
 
+                # Fast Quality V6 uses the phrase word count to size its
+                # StaticCache conservatively. Official inference ignores
+                # this attribute.
+                State.model.t3._las_phrase_word_count = _words(phrase)
+                if hasattr(State.model.t3, "_las_fast_quality_last"):
+                    delattr(State.model.t3, "_las_fast_quality_last")
+
                 try:
                     wav = _generate_chatterbox_phrase(
                         phrase,
@@ -486,6 +493,21 @@ def synthesize(
                     else:
                         raise
 
+                if active_backend == "cuda_graph":
+                    fast_meta = getattr(
+                        State.model.t3,
+                        "_las_fast_quality_last",
+                        {},
+                    ) or {}
+                    if fast_meta:
+                        print(
+                            "[Chatterbox] Fast Quality profile=adaptive_v6 "
+                            f"cap={fast_meta.get('adaptive_limit')} "
+                            f"tokens={fast_meta.get('tokens')} "
+                            f"fallback={fast_meta.get('fallback')}",
+                            flush=True,
+                        )
+
                 if hasattr(wav, "detach"):
                     audio = wav.detach().float().cpu().numpy()
                 else:
@@ -503,6 +525,12 @@ def synthesize(
                         )
                     )
         finally:
+            for attr in (
+                "_las_phrase_word_count",
+                "_las_fast_quality_last",
+            ):
+                if hasattr(State.model.t3, attr):
+                    delattr(State.model.t3, attr)
             State.model.t3.inference = previous_inference
 
     if not arrays:
@@ -516,7 +544,7 @@ def synthesize(
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "LocalChatterboxTTS/0.39.1"
+    server_version = "LocalChatterboxTTS/0.39.2"
 
     def log_message(self, fmt, *args):
         print("[Chatterbox]", fmt % args)
@@ -559,6 +587,8 @@ class Handler(BaseHTTPRequestHandler):
                     "fast_quality_cuda_graph": bool(
                         State.device.startswith("cuda")
                     ),
+                    "fast_quality_profile": "adaptive_v6",
+                    "fast_quality_adaptive_cache": True,
                 },
             )
             return
