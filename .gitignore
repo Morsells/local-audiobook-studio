@@ -57,3 +57,7 @@ Desktop.ini
 build/
 dist/
 *.egg-info/
+
+# Local performance benchmarks
+benchmark_*/
+Benchmark-*.bat
