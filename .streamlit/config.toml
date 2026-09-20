@@ -1,0 +1,12 @@
+[browser]
+gatherUsageStats = false
+
+[server]
+address = "127.0.0.1"
+headless = false
+enableXsrfProtection = true
+enableCORS = true
+
+[client]
+showErrorDetails = "full"
+toolbarMode = "minimal"

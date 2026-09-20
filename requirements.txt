@@ -1,0 +1,10 @@
+streamlit>=1.49,<2
+PyMuPDF>=1.28,<2
+kokoro-onnx>=0.6.1,<1
+soundfile>=0.13,<1
+numpy>=2,<3
+imageio-ffmpeg>=0.6,<1
+pytest>=8,<9
+
+EbookLib>=0.19,<1
+beautifulsoup4>=4.13,<5

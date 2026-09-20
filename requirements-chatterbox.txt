@@ -1,0 +1,10 @@
+# Local Chatterbox Multilingual V3 sidecar.
+#
+# IMPORTANT:
+# PyPI chatterbox-tts==0.1.7 predates the current V3-capable from_local(...)
+# API even though upstream still reports package version 0.1.7.
+# Pin to Resemble AI's official V3 release commit.
+chatterbox-tts @ https://github.com/resemble-ai/chatterbox/archive/65b18437192794391a0308a8f705b1e33e633948.zip
+
+huggingface_hub>=0.34
+soundfile>=0.13,<1

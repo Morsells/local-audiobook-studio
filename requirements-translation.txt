@@ -1,0 +1,7 @@
+# V3.5: install normally, then run Setup-GPU-Acceleration.bat to replace/upgrade
+# Torch with a CUDA-enabled build when an NVIDIA GPU is available.
+transformers>=4.51,<5
+sentencepiece>=0.2,<1
+sacremoses>=0.1,<1
+torch>=2.4
+huggingface_hub>=0.34

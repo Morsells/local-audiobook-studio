@@ -1,0 +1,2 @@
+EbookLib>=0.19,<1
+beautifulsoup4>=4.13,<5

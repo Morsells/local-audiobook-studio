@@ -1,0 +1,59 @@
+# ============================================================
+# Local Audiobook Studio
+# ============================================================
+
+# User / book data
+.audiobook_data/
+
+# Python virtual environments
+.venv/
+.venv-*/
+venv/
+env/
+
+# Python cache / test cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime / logs
+.runtime/
+logs/
+*.log
+
+# Local AI models
+models/
+
+# Local secrets / environment variables
+.streamlit/secrets.toml
+.env
+.env.*
+
+# Generated audio / audiobook files
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.m4b
+*.aac
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# IDE
+.vscode/
+.idea/
+
+# Windows / macOS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
